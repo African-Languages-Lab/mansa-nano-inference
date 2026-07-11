@@ -1,0 +1,11 @@
+# mansa-nano inference-only dependencies.
+# Install a torch build appropriate for your hardware first if needed, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124   (CUDA 12.4)
+#   pip install torch                                                       (CPU)
+torch>=2.4
+tiktoken>=0.7
+huggingface_hub>=0.24
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-dotenv>=1.0

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Model artifacts should be pulled from Hugging Face, never committed
+*.pt
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+*.pkl
