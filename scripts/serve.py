@@ -29,6 +29,7 @@ import torch
 import asyncio
 import logging
 import random
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -222,7 +223,13 @@ async def logo():
 
 
 async def generate_stream(worker: Worker, tokens, temperature=None, max_new_tokens=None, top_k=None) -> AsyncGenerator[str, None]:
-    """Generate assistant response with streaming."""
+    """Generate assistant response, streaming each token as it is produced.
+
+    Token generation is CPU/GPU-bound and blocking, so we run it in a background thread and
+    hand tokens to this async generator through an asyncio.Queue. Awaiting the queue yields
+    control back to the event loop between tokens, which lets the server actually flush each
+    SSE chunk to the socket as it arrives (rather than buffering the whole response).
+    """
     temperature = temperature if temperature is not None else args.temperature
     max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
     top_k = top_k if top_k is not None else args.top_k
@@ -230,30 +237,57 @@ async def generate_stream(worker: Worker, tokens, temperature=None, max_new_toke
     assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
     bos = worker.tokenizer.get_bos_token_id()
 
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    stop_event = threading.Event()
+    DONE = object()
+
+    def produce_tokens():
+        try:
+            for token_column, _ in worker.engine.generate(
+                tokens,
+                num_samples=1,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                seed=random.randint(0, 2**31 - 1)
+            ):
+                if stop_event.is_set():
+                    break
+                token = token_column[0]
+                if token == assistant_end or token == bos:
+                    break
+                loop.call_soon_threadsafe(queue.put_nowait, token)
+        except Exception as e:  # surface generation errors to the consumer
+            loop.call_soon_threadsafe(queue.put_nowait, e)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, DONE)
+
+    thread = threading.Thread(target=produce_tokens, daemon=True)
+    thread.start()
+
     accumulated_tokens = []
     last_clean_text = ""
-
-    for token_column, token_masks in worker.engine.generate(
-        tokens,
-        num_samples=1,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        seed=random.randint(0, 2**31 - 1)
-    ):
-        token = token_column[0]
-        if token == assistant_end or token == bos:
-            break
-        accumulated_tokens.append(token)
-        current_text = worker.tokenizer.decode(accumulated_tokens)
-        # Only emit text if it doesn't end with a replacement character (incomplete UTF-8)
-        if not current_text.endswith('\ufffd'):
-            new_text = current_text[len(last_clean_text):]
-            if new_text:
-                yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
-                last_clean_text = current_text
-
-    yield f"data: {json.dumps({'done': True})}\n\n"
+    try:
+        while True:
+            item = await queue.get()
+            if item is DONE:
+                break
+            if isinstance(item, Exception):
+                logger.error(f"Generation error: {item!r}")
+                break
+            accumulated_tokens.append(item)
+            current_text = worker.tokenizer.decode(accumulated_tokens)
+            # Only emit text if it doesn't end with a replacement character (incomplete UTF-8)
+            if not current_text.endswith('\ufffd'):
+                new_text = current_text[len(last_clean_text):]
+                if new_text:
+                    yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
+                    last_clean_text = current_text
+        yield f"data: {json.dumps({'done': True})}\n\n"
+    finally:
+        # Stop the producer if the client disconnected mid-stream (GeneratorExit) or we broke early.
+        stop_event.set()
 
 
 @app.post("/chat/completions")
@@ -316,7 +350,16 @@ async def chat_completions(request: ChatRequest):
                 logger.info("=" * 20)
                 await worker_pool.release_worker(worker)
 
-        return StreamingResponse(stream_and_release(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_and_release(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                # Disable proxy buffering (e.g. nginx) so chunks are flushed immediately.
+                "X-Accel-Buffering": "no",
+            },
+        )
     except Exception as e:
         await worker_pool.release_worker(worker)
         raise e
